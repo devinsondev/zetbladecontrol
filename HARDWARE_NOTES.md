@@ -28,16 +28,19 @@ OpenRGB uses a 65-byte application buffer **including Report ID** in its HIDAPI 
 
 - Reference: [OpenRGB ZET Blade Optical controller](https://github.com/CalcProgrammer1/OpenRGB/tree/master/Controllers/ZETKeyboardController), GPL-2.0-or-later.
 - Relevant commands in reference implementation: report ID `04`, RGB command `AE`, custom mode `1C`; seven-color built-in palette and 104-key layout.
-- **HID control is still experimental** on the target hardware: seeing a keyboard already lit green is *not proof* that a previous write changed its state.
-- Next step: use the app to select a distinctly different built-in static color, then test custom RGB, making only intentional manual writes.
-- Firmware may persist custom colors to nonvolatile memory: avoid high-frequency updates and automatic animation streaming.
+- **HID control is still experimental** on the target hardware. A first user test observed physical changes with the built-in Static effect; custom per-key RGB is not yet confirmed.
+- The Windows device reports 64 output bytes to HIDAPI for a 65-byte application packet (including Report ID); the controller tolerates that response while rejecting other short writes.
+- Next step: confirm several distinct built-in static colors, then manually test custom RGB once.
+- Firmware may persist built-in effects and custom colors to nonvolatile memory: avoid high-frequency writes and automatic animation streaming.
 
 ## Application
 
 - App and tests: [PR #1](https://github.com/devinsondev/zetbladecontrol/pull/1).
 - Python + Tkinter + HIDAPI.
-- Controls built-in effects and offers a 104-key RGB editor with JSON profile storage.
-- Physical hardware behavior requires manual testing before being declared supported.
+- Automatically connects at startup (and retries every 3 seconds if absent); opening the app does not automatically write an effect.
+- Automatically applies built-in effects on user changes with a 350 ms debounce and a minimum 1-second gap between successful writes.
+- The 104-key RGB editor retains **manual Apply** and JSON profile storage; it never streams per-key changes.
+- Full hardware compatibility still requires manual testing before being declared supported.
 
 ## Publication guidelines
 
