@@ -53,6 +53,22 @@ class ProtocolTests(unittest.TestCase):
                 with self.subTest(sent=sent), self.assertRaises(IOError):
                     device.send([packet])
 
+    def test_failed_open_closes_handle_for_auto_reconnect(self):
+        import blade_protocol
+        device = BladeDevice()
+        bad_handle = mock.Mock()
+        bad_handle.open_path.side_effect = OSError("Access denied")
+        good_handle = mock.Mock()
+        device_info = [{"usage_page": 0xFF00, "interface_number": 1, "path": b"test-path"}]
+        with mock.patch.object(blade_protocol.hid, "enumerate", return_value=device_info, create=True), \
+             mock.patch.object(blade_protocol.hid, "device", side_effect=[bad_handle, good_handle], create=True):
+            with self.assertRaises(OSError):
+                device.connect()
+            self.assertIsNone(device.dev)
+            bad_handle.close.assert_called_once_with()
+            device.connect()
+            self.assertIs(device.dev, good_handle)
+
     def test_invalid_hid_packet_length_is_rejected(self):
         device = BladeDevice()
         device.dev = mock.Mock()
