@@ -1,5 +1,6 @@
 """ZET Blade Control — Windows Tkinter RGB editor."""
 import json
+import time
 import tkinter as tk
 from tkinter import ttk, colorchooser, filedialog, messagebox
 from pathlib import Path
@@ -12,6 +13,10 @@ PANEL = "#1D2737"
 TEXT = "#EAF1FF"
 ACCENT = "#54C7FF"
 DEFAULT = "#3A8CFF"
+# Effects may be persisted by firmware. Coalesce rapid changes; never stream frames.
+EFFECT_SETTLE_MS = 350
+EFFECT_MIN_INTERVAL_MS = 1000
+RECONNECT_MS = 3000
 
 class App:
     def __init__(self, root):
@@ -24,14 +29,25 @@ class App:
         self.colors=[DEFAULT]*104
         self.pen=DEFAULT
         self.widgets=[]
-        self.status=tk.StringVar(value="Disconnected — preview mode")
+        self.status=tk.StringVar(value="Looking for ZET Blade USB keyboard...")
         self.mode=tk.StringVar(value="Static")
         self.palette=tk.StringVar(value="Blue")
         self.rainbow=tk.BooleanVar(value=False)
         self.speed=tk.IntVar(value=2)
         self.brightness=tk.IntVar(value=4)
+        self._closed=False
+        self._connect_job=None
+        self._effect_job=None
+        self._effect_queued=False
+        self._last_effect_packet=None
+        self._last_effect_at=None
         self._ui()
+        # Install observers after widgets initialize, so opening the app never
+        # changes the keyboard's existing effect or writes to firmware.
+        for setting in (self.mode, self.palette, self.rainbow, self.speed, self.brightness):
+            setting.trace_add("write", self.queue_effect)
         self.root.protocol("WM_DELETE_WINDOW",self.close)
+        self._schedule_connect(100)
 
     def _button(self, parent, title, action, **kw):
         return tk.Button(parent,text=title,command=action,bg=PANEL,fg=TEXT,
@@ -43,8 +59,7 @@ class App:
         head.pack(fill="x",padx=22,pady=(18,8))
         tk.Label(head,text="ZET / BLADE",font=("Segoe UI",21,"bold"),
                  fg=TEXT,bg=BACKGROUND).pack(side="left")
-        self._button(head,"Connect USB",self.connect).pack(side="right",padx=4)
-        self._button(head,"Disconnect",self.disconnect).pack(side="right",padx=4)
+        tk.Label(head,text="USB auto-connect",fg=ACCENT,bg=BACKGROUND).pack(side="right",padx=4)
 
         tabs=ttk.Notebook(self.root)
         tabs.pack(fill="both",expand=True,padx=20,pady=8)
@@ -59,14 +74,14 @@ class App:
         footer.pack(fill="x",padx=22,pady=(0,16))
         tk.Label(footer,textvariable=self.status,fg=ACCENT,bg=BACKGROUND,
                  anchor="w",font=("Segoe UI",10)).pack(side="left",fill="x",expand=True)
-        tk.Label(footer,text="2EA8:2125 • manual writes only • no streaming",
+        tk.Label(footer,text="2EA8:2125 • effects auto-apply • custom RGB manual",
                  fg="#9BA9BD",bg=BACKGROUND).pack(side="right")
 
     def _effect_ui(self):
         panel=tk.Frame(self.effects,bg=BACKGROUND)
         panel.pack(anchor="nw",padx=32,pady=30)
         self._caption(panel,"DEVICE EFFECTS")
-        tk.Label(panel,text="Select a built-in effect, then click Apply.",
+        tk.Label(panel,text="Effects apply automatically after you change a setting.",
                  fg="#9BA9BD",bg=BACKGROUND).pack(anchor="w",pady=(0,18))
         r=tk.Frame(panel,bg=BACKGROUND)
         r.pack(anchor="w",pady=6)
@@ -87,9 +102,8 @@ class App:
             tk.Scale(r,from_=0,to=4,orient="horizontal",variable=variable,
                      bg=BACKGROUND,fg=TEXT,highlightthickness=0,length=280,
                      troughcolor=PANEL).pack(side="left")
-        self._button(panel,"Apply effect to keyboard",self.apply_effect).pack(anchor="w",pady=20)
         tk.Label(panel,text="Static mode supports 7 hardware colors only. Custom RGB is in the other tab.",
-                 fg="#9BA9BD",bg=BACKGROUND,wraplength=650,justify="left").pack(anchor="w")
+                 fg="#9BA9BD",bg=BACKGROUND,wraplength=650,justify="left").pack(anchor="w",pady=(18,0))
 
     def _caption(self,parent,title):
         tk.Label(parent,text=title,fg=ACCENT,bg=BACKGROUND,
@@ -143,25 +157,69 @@ class App:
         self.status.set("Error: "+str(exc))
         messagebox.showerror("ZET Blade Control",str(exc))
 
-    def connect(self):
+    def _schedule_connect(self, delay=RECONNECT_MS):
+        if not self._closed and self._connect_job is None and self.device.dev is None:
+            self._connect_job=self.root.after(delay,self._try_connect)
+
+    def _try_connect(self):
+        self._connect_job=None
+        if self._closed or self.device.dev is not None:
+            return
         try:
             self.device.connect()
-            self.status.set("Connected to 2EA8:2125 — ready")
         except Exception as exc:
-            self.report_error(exc)
+            # Absence on startup is normal. Do not show a modal error every 3s.
+            self.status.set("Waiting for ZET Blade USB (close other RGB apps): "+str(exc))
+            self._schedule_connect()
+            return
+        self._last_effect_packet=None
+        self.status.set("Connected to 2EA8:2125 — effects apply automatically")
+        if self._effect_queued:
+            self._schedule_effect()
 
-    def disconnect(self):
-        self.device.close()
-        self.status.set("Disconnected")
+    def queue_effect(self, *_):
+        if self._closed:
+            return
+        self._effect_queued=True
+        if self.device.dev is None:
+            self.status.set("Waiting for keyboard — effect queued")
+            self._schedule_connect(100)
+            return
+        self.status.set("Effect selected — applying after a short pause")
+        self._schedule_effect()
 
-    def apply_effect(self):
+    def _schedule_effect(self):
+        if self._effect_job is not None:
+            self.root.after_cancel(self._effect_job)
+        delay=EFFECT_SETTLE_MS
+        if self._last_effect_at is not None:
+            remaining=int(EFFECT_MIN_INTERVAL_MS - (time.monotonic()-self._last_effect_at)*1000)
+            delay=max(delay,remaining)
+        self._effect_job=self.root.after(delay,self._apply_queued_effect)
+
+    def _apply_queued_effect(self):
+        self._effect_job=None
+        if self._closed or not self._effect_queued:
+            return
+        if self.device.dev is None:
+            self._schedule_connect(100)
+            return
         try:
             packet=effect_packet(self.mode.get(),self.palette.get(),
                                  self.speed.get(),self.brightness.get(),self.rainbow.get())
-            self.device.send([packet])
+            if packet!=self._last_effect_packet:
+                self.device.send([packet])
+                self._last_effect_packet=packet
+                self._last_effect_at=time.monotonic()
+            self._effect_queued=False
             self.status.set("Effect applied: "+self.mode.get())
         except Exception as exc:
-            self.report_error(exc)
+            # The device may have unplugged. Never retry a potentially
+            # persistent write automatically after an uncertain HID error.
+            self._effect_queued=False
+            self.device.close()
+            self.status.set("HID error (change a setting to retry): "+str(exc))
+            self._schedule_connect()
 
     def pick_color(self):
         _,color=colorchooser.askcolor(color=self.pen,parent=self.root)
@@ -215,6 +273,12 @@ class App:
             self.report_error(exc)
 
     def close(self):
+        self._closed=True
+        for job in (self._effect_job, self._connect_job):
+            if job is not None:
+                self.root.after_cancel(job)
+        self._effect_job=None
+        self._connect_job=None
         self.device.close()
         self.root.destroy()
 
