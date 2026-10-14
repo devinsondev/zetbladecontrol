@@ -1,5 +1,7 @@
 """ZET Blade protocol (adapted from OpenRGB GPL-2.0-or-later)."""
 import time
+import sys
+import re
 import hid
 
 VID, PID = 0x2EA8, 0x2125
@@ -17,9 +19,8 @@ KEYS = (["Esc"]+["F"+str(i) for i in range(1,13)]+["PrtSc","Scroll","Pause"]
 assert len(KEYS) == 104
 
 def validate_color(color):
-    if not isinstance(color,str) or len(color)!=7 or color[0]!="#":
+    if not isinstance(color, str) or re.fullmatch(r"#[0-9A-Fa-f]{6}", color) is None:
         raise ValueError("Color must be #RRGGBB")
-    bytes.fromhex(color[1:])
     return color.upper()
 
 def level(n):
@@ -84,9 +85,15 @@ class BladeDevice:
         if self.dev is None:
             raise RuntimeError("Connect first")
         for packet in packets:
-            sent=self.dev.write(packet)
-            if sent!=len(packet):
-                raise IOError("HID write incomplete: %s/%s" % (sent,len(packet)))
+            # OpenRGB uses 65-byte buffers, including Report ID 0x04.
+            if len(packet) != 65:
+                raise ValueError("ZET Blade HID packet must be 65 bytes including Report ID")
+            sent = self.dev.write(packet)
+            # On Windows, HIDAPI returns the 64-byte OutputReportByteLength
+            # reported by this keyboard, even for a 65-byte application buffer.
+            windows_report_written = sys.platform == "win32" and sent == 64
+            if sent != len(packet) and not windows_report_written:
+                raise IOError("HID write incomplete: %s/%s" % (sent, len(packet)))
             time.sleep(0.012)
     def close(self):
         if self.dev:
