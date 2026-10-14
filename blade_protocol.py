@@ -80,7 +80,12 @@ class BladeDevice:
             raise RuntimeError("ZET Blade FF00 interface not found; close OpenRGB and vendor software")
         self.close()
         self.dev=hid.device()
-        self.dev.open_path(devices[0]["path"])
+        try:
+            self.dev.open_path(devices[0]["path"])
+        except Exception:
+            # Failed open must not leave a fake "connected" handle behind.
+            self.close()
+            raise
     def send(self, packets):
         if self.dev is None:
             raise RuntimeError("Connect first")
