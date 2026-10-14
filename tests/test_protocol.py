@@ -2,8 +2,9 @@
 import sys
 import types
 import unittest
+from unittest import mock
 sys.modules.setdefault("hid", types.SimpleNamespace())
-from blade_protocol import KEYS, SKIPS, effect_packet, custom_packets
+from blade_protocol import KEYS, SKIPS, BladeDevice, effect_packet, custom_packets, validate_color
 
 
 class ProtocolTests(unittest.TestCase):
@@ -29,6 +30,35 @@ class ProtocolTests(unittest.TestCase):
     def test_bad_color(self):
         with self.assertRaises(ValueError):
             custom_packets(["invalid"] * 104, 4)
+        # bytes.fromhex() silently ignores spaces: reject these before encoding.
+        with self.assertRaises(ValueError):
+            validate_color("#AA BB ")
+
+    def test_windows_hid_write_reports_64(self):
+        device = BladeDevice()
+        device.dev = mock.Mock()
+        device.dev.write.return_value = 64
+        packet = effect_packet("Static", "Blue", 2, 4)
+        with mock.patch("blade_protocol.sys.platform", "win32"), mock.patch("blade_protocol.time.sleep"):
+            device.send([packet])
+        device.dev.write.assert_called_once_with(packet)
+
+    def test_real_short_hid_writes_are_rejected(self):
+        device = BladeDevice()
+        device.dev = mock.Mock()
+        packet = effect_packet("Static", "Blue", 2, 4)
+        with mock.patch("blade_protocol.sys.platform", "win32"), mock.patch("blade_protocol.time.sleep"):
+            for sent in (-1, 63):
+                device.dev.write.return_value = sent
+                with self.subTest(sent=sent), self.assertRaises(IOError):
+                    device.send([packet])
+
+    def test_invalid_hid_packet_length_is_rejected(self):
+        device = BladeDevice()
+        device.dev = mock.Mock()
+        with self.assertRaises(ValueError):
+            device.send([bytes(64)])
+        device.dev.write.assert_not_called()
 
 
 if __name__ == "__main__":
